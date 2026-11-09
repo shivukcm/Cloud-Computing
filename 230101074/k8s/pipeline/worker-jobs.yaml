@@ -1,0 +1,86 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pipeline
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: teacher-worker-shard-0
+  namespace: pipeline
+spec:
+  template:
+    metadata:
+      labels:
+        job: teacher-worker
+        shard: "0"
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: worker
+          image: python:3.11-slim
+          command: ["python", "/app/worker/worker.py"]
+          env:
+            - name: SHARD_INDEX
+              value: "0"
+            - name: SHARD_COUNT
+              value: "2"
+            - name: OLLAMA_HOST
+              value: "http://host.k3d.internal:11434"
+            - name: MODEL_NAME
+              value: "phi3.5"
+            - name: COMMANDS_FILE
+              value: "/app/data/commands_pool.jsonl"
+            - name: OUTPUT_FILE
+              value: "/app/datasets/teacher/shard-0.jsonl"
+            - name: PROMPT_FILE
+              value: "/app/prompts/teacher_prompt.txt"
+          volumeMounts:
+            - name: app-volume
+              mountPath: /app
+      volumes:
+        - name: app-volume
+          hostPath:
+            path: /src
+            type: Directory
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: teacher-worker-shard-1
+  namespace: pipeline
+spec:
+  template:
+    metadata:
+      labels:
+        job: teacher-worker
+        shard: "1"
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: worker
+          image: python:3.11-slim
+          command: ["python", "/app/worker/worker.py"]
+          env:
+            - name: SHARD_INDEX
+              value: "1"
+            - name: SHARD_COUNT
+              value: "2"
+            - name: OLLAMA_HOST
+              value: "http://host.k3d.internal:11434"
+            - name: MODEL_NAME
+              value: "phi3.5"
+            - name: COMMANDS_FILE
+              value: "/app/data/commands_pool.jsonl"
+            - name: OUTPUT_FILE
+              value: "/app/datasets/teacher/shard-1.jsonl"
+            - name: PROMPT_FILE
+              value: "/app/prompts/teacher_prompt.txt"
+          volumeMounts:
+            - name: app-volume
+              mountPath: /app
+      volumes:
+        - name: app-volume
+          hostPath:
+            path: /src
+            type: Directory

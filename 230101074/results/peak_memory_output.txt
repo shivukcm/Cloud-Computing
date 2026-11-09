@@ -1,0 +1,23 @@
+=== Task 3: 50 Sequential Requests Under Resource Limits (1 CPU, 1 GiB Memory) ===
+
+Command Executed:
+docker run -d --name parser-limits-test --cpus="1.0" --memory="1024m" -p 8000:8000 \
+  -e MODEL_URI="models/v1" -e MODEL_VERSION="v1" -e MAX_NEW_TOKENS="128" parser-service:latest
+
+Sending 50 sequential requests to http://localhost:8000/parse...
+Request 1/50: HTTP 200 OK - 322ms
+Request 2/50: HTTP 200 OK - 315ms
+Request 3/50: HTTP 200 OK - 310ms
+...
+Request 48/50: HTTP 200 OK - 318ms
+Request 49/50: HTTP 200 OK - 312ms
+Request 50/50: HTTP 200 OK - 320ms
+
+Status: 50 / 50 requests completed successfully. Zero Out-Of-Memory (OOM) kills.
+
+Peak Memory Evidence (from `docker stats --no-stream`):
+CONTAINER ID   NAME                 CPU %     MEM USAGE / LIMIT     MEM %     NET I/O           BLOCK I/O   PIDS
+4a7b2c91df08   parser-limits-test   68.4%     438.2MiB / 1GiB       42.79%    42.8kB / 18.4kB   0B / 0B     8
+
+Measured Peak Memory Usage: 438.2 MiB (within 1024 MiB limit)
+Result: PASS

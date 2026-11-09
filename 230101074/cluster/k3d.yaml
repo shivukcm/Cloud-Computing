@@ -1,0 +1,24 @@
+# k3d cluster configuration for local Kubernetes environment
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: local-cloud
+servers: 1
+agents: 1
+image: rancher/k3s:v1.28.8-k3s1
+ports:
+  - port: 8080:80
+    nodeFilters:
+      - loadbalancer
+  - port: 8333:8333
+    nodeFilters:
+      - loadbalancer
+options:
+  k3s:
+    extraArgs:
+      - arg: --kubelet-arg=eviction-hard=imagefs.available<1%,nodefs.available<1%
+        nodeFilters:
+          - server:*
+      - arg: --kubelet-arg=eviction-minimum-reclaim=imagefs.available=1%,nodefs.available=1%
+        nodeFilters:
+          - server:*

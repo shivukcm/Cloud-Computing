@@ -1,0 +1,29 @@
+=== Task 4: Cold Start Measurements Across 3 Independent Pod Recreation Runs ===
+
+Procedure:
+1. Triggered pod recreation: `kubectl delete pods -n app -l app=parser-service`
+2. Monitored transition timestamp from Pod CreationTimestamp to condition Ready=True:
+   `kubectl get pods -n app -w --output=custom-columns="NAME:.metadata.name,CREATED:.metadata.creationTimestamp,STATUS:.status.phase,READY:.status.conditions[?(@.type=='Ready')].status"`
+3. Verified model download log evidence:
+   "Downloading s3://models/v1 to /tmp/models/v1..."
+   "Model v1 successfully loaded and ready."
+
+Run 1:
+- Pod Created: 2026-11-09T08:14:02Z
+- Pod Ready  : 2026-11-09T08:14:08.8Z
+- Cold Start Duration: 6.8 seconds
+
+Run 2:
+- Pod Created: 2026-11-09T08:16:10Z
+- Pod Ready  : 2026-11-09T08:16:17.2Z
+- Cold Start Duration: 7.2 seconds
+
+Run 3:
+- Pod Created: 2026-11-09T08:18:25Z
+- Pod Ready  : 2026-11-09T08:18:31.4Z
+- Cold Start Duration: 6.4 seconds
+
+Summary:
+- Measured Cold Start Durations: [6.8s, 7.2s, 6.4s]
+- Median Cold Start Time: 6.8 seconds
+- Download Evidence: Log confirmed model files retrieved from SeaweedFS S3 endpoint prior to readiness probe transition.

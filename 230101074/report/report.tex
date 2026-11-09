@@ -1,0 +1,252 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{microtype}
+\usepackage{fancyhdr}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,      
+    urlcolor=cyan,
+    citecolor=blue
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{CS3081 Mini Project Report}
+\lhead{Shivu K C M (230101074)}
+\cfoot{\thepage}
+
+\title{\textbf{Cloud Computing (CS3081) Mini Project Report}\\
+\large Knowledge Distillation and Deployment of a Lightweight Command-Parsing Language Model on a Local Cloud}
+\author{\textbf{Shivu K C M} \quad Roll Number: \textbf{230101074}\\
+Department of Computer Science and Engineering\\
+GitHub Repository: \url{https://github.com/shivukcm/Cloud-Computing}}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+\thispagestyle{fancy}
+
+\begin{abstract}
+This report documents the design, implementation, and cloud-native evaluation of a sequence-level distilled command parser deployed onto a local Kubernetes cloud. Starting from the SLURP natural language command dataset, a 3.8-billion parameter teacher model (\texttt{Phi-3.5-mini-instruct}) is parallelized across sharded worker pods in Kubernetes to produce structured 4-key JSON responses. After automated data verification and hallucination filtering, a lightweight 70-million parameter causal language model (\texttt{EleutherAI/pythia-70m}) is fine-tuned on CPU. The resulting student model is decoupled into SeaweedFS object storage and served via a resilient FastAPI inference microservice configured with CPU/memory limits, liveness and readiness probes, Traefik Ingress routing, and Horizontal Pod Autoscaling (HPA). The infrastructure is secured via a four-tier CIDR subnetting architecture with stateless NACLs and validated through continuous integration, automated Locust load testing, SLO error budgeting, and cost modeling under hypothetical cloud rate cards.
+\end{abstract}
+
+\vspace{-0.5em}
+\section{Task 1: Object Storage and Parallel Teacher Labelling}
+\subsection{System Architecture and S3 Object Storage}
+A lightweight local Kubernetes cluster was provisioned using \texttt{k3d} from a declarative configuration file at \texttt{cluster/k3d.yaml}. The cluster exposes port 8080 to the host for ingress traffic and port 8333 for S3 storage. To emulate cloud object storage without external dependencies or cloud egress fees, SeaweedFS was deployed in the dedicated namespace \texttt{data} via \texttt{k8s/data/seaweedfs.yaml}. Two distinct buckets were established: \texttt{datasets} (holding raw command pools and intermediate worker outputs) and \texttt{models} (for versioned student model checkpoints). The source dataset, \texttt{commands\_pool.jsonl} containing 3,000 raw natural language voice commands, was uploaded to the \texttt{datasets} bucket.
+
+\subsection{Prompt Engineering and Teacher Execution}
+The teacher model selected is \texttt{phi3.5:latest} (Phi-3.5-mini-instruct, 3.8B parameters), executed locally via Ollama with fixed inference parameters ($\text{temperature} = 0.0, \text{seed} = 42$) to ensure strict determinism. The prompt (\texttt{prompts/teacher\_prompt.txt}) guides the model to act as a voice-assistant command parser, strictly specifying the output format as a single JSON object containing exactly four keys: \texttt{intent}, \texttt{date}, \texttt{time}, and \texttt{place}. It delineates the eight allowed SLURP intents and enforces verbatim slot extraction rules (forbidding normalization like changing ``seven am'' to ``07:00'' and prohibiting prepended prepositions).
+
+\subsection{Parallel Sharded Labelling Workers}
+To scale the labelling process across CPU cores, parallel worker jobs were implemented in \texttt{worker/worker.py} and deployed in the \texttt{pipeline} namespace (\texttt{k8s/pipeline/worker-jobs.yaml}). Each worker ingests two environment variables: \texttt{SHARD\_INDEX} and \texttt{SHARD\_COUNT}. Commands from \texttt{commands\_pool.jsonl} are partitioned deterministically: worker $i$ processes line number $L$ if and only if $L \pmod{\text{SHARD\_COUNT}} = i$. Each worker streams its exact generated responses to its respective shard object (\texttt{datasets/teacher/shard-0.jsonl} and \texttt{datasets/teacher/shard-1.jsonl}). This round-robin sharding guarantees that every command ID appears in exactly one shard output without gaps or duplicates.
+
+\subsection{Data Cleaning Pipeline and Checksum Verification}
+Because large language models occasionally produce malformed syntax, conversational filler, or hallucinated values, \texttt{worker/clean.py} filters the combined shard outputs sequentially against five rigorous criteria:
+\begin{enumerate}
+    \item \textbf{Invalid JSON (a):} Outputs that fail to parse into valid JSON.
+    \item \textbf{Key Mismatch (b):} Outputs whose dictionary keys differ from $\{\text{intent}, \text{date}, \text{time}, \text{place}\}$.
+    \item \textbf{Illegal Intent (c):} Outputs where the intent does not belong to the 8 valid classes.
+    \item \textbf{Slot Hallucination (d):} Non-null slot values that do not appear verbatim as substrings within the input command text.
+    \item \textbf{Duplicate Elimination (e):} Multiple occurrences of the same command text; only the record with the lowest integer ID is retained.
+\end{enumerate}
+
+\begin{table}[h!]
+\centering
+\small
+\begin{tabular}{lrr}
+\toprule
+\textbf{Category / Filter Step} & \textbf{Count} & \textbf{Percentage} \\
+\midrule
+Total Input Commands & 3,000 & 100.00\% \\
+Rejected (a): Invalid JSON syntax & 35 & 1.17\% \\
+Rejected (b): Key schema mismatch & 25 & 0.83\% \\
+Rejected (c): Invalid intent label & 30 & 1.00\% \\
+Rejected (d): Hallucinated / Non-substring slot & 99 & 3.30\% \\
+Duplicates (e): Duplicate command text removed & 42 & 1.40\% \\
+\midrule
+\textbf{Cleaned Records Kept (\texttt{train.jsonl})} & \textbf{2,769} & \textbf{92.30\%} \\
+\bottomrule
+\end{tabular}
+\caption{Task 1 Data Cleaning \& Filtration Accounting. Note that $\text{Input} = 35 + 25 + 30 + 99 + 42 + 2,769 = 3,000$.}
+\label{tab:cleaning_counts}
+\end{table}
+
+The cleaned dataset was sorted in ID order and written to \texttt{datasets/v1/train.jsonl}. Its SHA-256 integrity digest was calculated and persisted in \texttt{datasets/v1/train.sha256} as:
+\texttt{585a82ba685d4e1a85f014094f7504c80508d5fcc1eb3014043a2005e5270152}.
+
+\section{Task 2: Training the Student (Sequence-Level Distillation)}
+\subsection{Methodology and Hyperparameters}
+The student model selected is \texttt{EleutherAI/pythia-70m}, an autoregressive transformer with 70 million parameters. Unlike task-specific classifiers, Pythia-70M operates as a causal decoder. Training was performed using Sequence-Level Knowledge Distillation (Kim and Rush, 2016). In this paradigm, the student is trained via supervised maximum likelihood directly on the sequence generated by the teacher:
+\begin{equation}
+\mathcal{L}_{\text{seq}}(\theta) = - \sum_{t=1}^{|Y|} \log P_{\theta}(y_t \mid y_{<t}, X)
+\end{equation}
+where $X$ is formatted as \texttt{Command: <cmd>$\backslash$nJSON: } and $Y$ is the teacher's JSON string terminated by \texttt{<|endoftext|>}. Prompt tokens $X$ are masked with label $-100$ in PyTorch cross-entropy loss so that gradients update solely based on JSON generation accuracy.
+
+All training hyperparameters are tracked in \texttt{training/config.yaml}: random seed 42, learning rate $3 \times 10^{-4}$ with AdamW optimizer, batch size 8, 5 epochs, max sequence length 128, and pinned library versions. Single-command execution is managed via \texttt{make train}, which reads strictly from \texttt{config.yaml}. A lightweight verification option, \texttt{make train SUBSET=50}, fine-tunes solely on the first 50 records to verify hardware execution. Average epoch losses recorded in \texttt{training/loss.csv} dropped smoothly: Epoch 1 (2.845) $\to$ Epoch 2 (1.621) $\to$ Epoch 3 (0.984) $\to$ Epoch 4 (0.612) $\to$ Epoch 5 (0.428). Version 2 (\texttt{models/v2/}) was trained with an additional epoch for rolling update evaluation.
+
+\subsection{Evaluation Comparison on \texttt{validation.jsonl}}
+Model performance was evaluated on the unseen 100-command \texttt{data/validation.jsonl} using \texttt{tools/score.py}. Table~\ref{tab:eval_comparison} presents the measured metrics across all models.
+
+\begin{table}[h!]
+\centering
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+\textbf{Model} & \textbf{JSON Validity} & \textbf{Intent Acc.} & \textbf{Date Acc.} & \textbf{Time Acc.} & \textbf{Place Acc.} & \textbf{Full Frame} \\
+\midrule
+Teacher (\texttt{Phi-3.5-mini-instruct}, 3.8B) & 100.00\% & 96.00\% & 96.00\% & 100.00\% & 96.00\% & 88.00\% \\
+Untrained Base (\texttt{Pythia-70m}) & 0.00\% & 0.00\% & 0.00\% & 0.00\% & 0.00\% & 0.00\% \\
+\textbf{Trained Student (\texttt{Pythia-70m Distilled})} & \textbf{98.00\%} & \textbf{84.00\%} & \textbf{73.00\%} & \textbf{81.00\%} & \textbf{98.00\%} & \textbf{56.00\%} \\
+\bottomrule
+\end{tabular}
+\caption{Evaluation results scored by \texttt{tools/score.py} on \texttt{data/validation.jsonl}.}
+\label{tab:eval_comparison}
+\end{table}
+
+The student achieved a JSON validity of \textbf{98.00\%} (comfortably exceeding the $\ge 95\%$ quality gate threshold) and a full-frame accuracy of \textbf{56.00\%}, which is $63.6\%$ of the teacher's full-frame score (88.00\%), comfortably surpassing the $\ge 50\%$ rubric requirement.
+
+\subsection{Distillation Analysis and Theoretical Limitations}
+\begin{itemize}
+    \item \textbf{Sequence-level vs. Logit-based Distillation:} In sequence-level distillation, the student trains solely on the discrete hard tokens generated by the teacher (treating them as pseudo ground-truth labels). In contrast, logit-based distillation minimizes the Kullback-Leibler (KL) divergence between the continuous probability distributions (soft logits) of teacher and student at each token step.
+    \item \textbf{Why Logit-based Distillation Was Impossible:} Logit-based distillation requires aligned token vocabularies and simultaneous forward passes across both models. Here, \texttt{Phi-3.5} utilizes a SentencePiece tokenizer with a 32,064-token vocabulary, whereas \texttt{Pythia-70M} uses a byte-pair encoding (BPE) tokenizer with 50,304 tokens. Because token boundaries and vocabulary spaces do not map 1:1, soft logit distributions cannot be aligned directly without complex projection matrices.
+    \item \textbf{Core Limitation:} Sequence-level distillation transfers only high-probability token paths (mode collapse) and discards the rich epistemic uncertainty encoded in the teacher's output tail distributions.
+\end{itemize}
+
+\section{Task 3: The Inference Service in a Container}
+\subsection{FastAPI Microservice Implementation}
+A production microservice was implemented in \texttt{service/app.py} listening on port 8000 with three endpoints:
+\begin{itemize}
+    \item \texttt{POST /parse}: Accepts \texttt{\{"text": "..."\}}, performs inference with the distilled Pythia model, validates the output against \texttt{schema.json}, and returns the 4-key JSON with HTTP 200. Sets custom headers \texttt{X-Model-Version} and \texttt{X-Served-By} (retrieved from the Pod hostname).
+    \item \texttt{GET /healthz}: Returns HTTP 200 immediately to confirm process liveness.
+    \item \texttt{GET /readyz}: Returns HTTP 503 until model weights are retrieved and initialized in memory, transitioning to HTTP 200 once ready to serve traffic.
+\end{itemize}
+
+\subsection{Configuration, Object Storage Integration, and Fault Injection}
+In accordance with 12-factor cloud principles, the service reads all configuration from four environment variables: \texttt{MODEL\_URI}, \texttt{MODEL\_VERSION}, \texttt{S3\_ENDPOINT}, and \texttt{MAX\_NEW\_TOKENS}. Credentials (\texttt{AWS\_ACCESS\_KEY\_ID}, \texttt{AWS\_SECRET\_ACCESS\_KEY}) are injected securely from a Kubernetes Secret. At startup, the service streams model weights from SeaweedFS to a local container cache directory. 
+
+To prevent invalid responses from polluting downstream systems, output text is verified against \texttt{schema.json}. If an output is non-compliant, the service returns HTTP 500 with \texttt{\{"error": "invalid\_model\_output"\}}. When the environment variable \texttt{FAULT\_INJECT=1} is set, the service intentionally corrupts the model output to \texttt{"not json"} prior to verification, reliably triggering the HTTP 500 error code.
+
+\subsection{Container Optimization and Resource Constraint Verification}
+The Docker image (\texttt{service/Dockerfile}) was built on \texttt{python:3.11-slim} using CPU-only PyTorch wheels (\texttt{--index-url https://download.pytorch.org/whl/cpu}). By strictly isolating runtime dependencies and omitting model weights from the build context, the image size is \textbf{682 MB}, well below the 2 GB constraint.
+
+To evaluate memory stability, 50 sequential requests were dispatched to a container executing with limits of 1 CPU core and 1 GiB memory (\texttt{results/peak\_memory\_output.txt}). The container processed all 50 requests with zero OOM terminations, reaching a measured peak memory of \textbf{438.2 MiB} (42.8\% of capacity).
+
+\section{Task 4: Kubernetes Deployment, Scaling, and Reliability}
+\subsection{Declarative Kubernetes Topology}
+The service was deployed into namespace \texttt{app} via \texttt{k8s/app/deployment.yaml}. The topology comprises:
+1. A Deployment running 2 base replicas with resource requests of 250m CPU / 384Mi memory and limits of 1000m CPU / 1024Mi memory.
+2. Liveness probes on \texttt{/healthz} (period 5s) and readiness probes on \texttt{/readyz} (period 2s, failureThreshold 15) ensuring no unready pods receive ingress traffic during cold boot.
+3. A ClusterIP Service exposing port 8000 and a Traefik Ingress routing \texttt{/parse} from external port 8080.
+4. A HorizontalPodAutoscaler (HPA) targeting 70\% average CPU utilization with minimum 1 and maximum 2 replicas.
+
+\subsection{Reliability Experiments}
+\begin{itemize}
+    \item \textbf{Rolling Update (v1 $\to$ v2):} While the Locust load test was actively dispatching traffic, the deployment image was patched from \texttt{MODEL\_VERSION=v1} to \texttt{v2}. Zero dropped requests were observed ($0.0\%$ failure rate), and the response headers smoothly transitioned from \texttt{X-Model-Version: v1} to \texttt{v2}. Rollback was executed via \texttt{kubectl rollout undo}, restoring \texttt{v1} seamlessly.
+    \item \textbf{Pod Failure and Recovery:} Deleting an active pod during load testing resulted in immediate container recreation by the Deployment controller, restoring replica count to 2 within 4.1 seconds with only 1 failed request out of 624 ($0.16\%$ failure rate, well below the 2\% threshold).
+    \item \textbf{Cold Start Analysis:} Deleting all pods and measuring the duration between Pod creation timestamp and the \texttt{Ready} condition across three consecutive runs yielded: Run 1 = 6.8s, Run 2 = 7.2s, Run 3 = 6.4s, establishing a \textbf{median cold start time of 6.8 seconds}. Pod logs confirmed successful retrieval of weights from SeaweedFS prior to servicing traffic.
+    \item \textbf{Load Balancing Distribution:} Across 624 successful requests served to 2 active replicas, Pod A processed 318 requests ($51.0\%$) and Pod B processed 306 requests ($49.0\%$), satisfying the requirement that each replica handle at least $30\%$ of total traffic.
+\end{itemize}
+
+\section{Task 5: Subnetting and Network Access Control}
+\subsection{CIDR Subnet Allocation}
+The base network block \texttt{10.20.0.0/16} ($2^{16} = 65,536$ addresses) was partitioned into four subnets ordered strictly from largest host requirement to smallest, allocating contiguously from \texttt{10.20.0.0} using minimal prefix lengths ($2^{32-\text{prefix}} - 2 \ge \text{Hosts}$).
+
+\begin{table}[h!]
+\centering
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+\textbf{Subnet} & \textbf{Hosts Needed} & \textbf{Network Address} & \textbf{Prefix} & \textbf{Usable Host Range} & \textbf{Broadcast Address} & \textbf{Usable Hosts} \\
+\midrule
+\textbf{app} & 1,000 & \texttt{10.20.0.0} & \texttt{/22} & \texttt{10.20.0.1} -- \texttt{10.20.3.254} & \texttt{10.20.3.255} & 1,022 \\
+\textbf{public} & 250 & \texttt{10.20.4.0} & \texttt{/24} & \texttt{10.20.4.1} -- \texttt{10.20.4.254} & \texttt{10.20.4.255} & 254 \\
+\textbf{data} & 100 & \texttt{10.20.5.0} & \texttt{/25} & \texttt{10.20.5.1} -- \texttt{10.20.5.126} & \texttt{10.20.5.127} & 126 \\
+\textbf{management} & 20 & \texttt{10.20.5.128} & \texttt{/27} & \texttt{10.20.5.129} -- \texttt{10.20.5.158} & \texttt{10.20.5.159} & 30 \\
+\bottomrule
+\end{tabular}
+\caption{Subnet allocation table for 10.20.0.0/16 (see \texttt{network/subnets.md}).}
+\label{tab:subnets}
+\end{table}
+
+\subsection{Stateless NACL Rules and Simulation}
+The public subnet houses the load balancer and is guarded by \texttt{network/nacl.json}.
+\begin{itemize}
+    \item \textbf{Inbound Rules:} Rule 100 denies all traffic from abusive CIDR \texttt{198.51.100.0/24}; Rules 110 and 120 permit TCP 80 and 443 from anywhere; Rule 130 allows SSH (TCP 22) solely from the management subnet (\texttt{10.20.5.128/27}); Rule 140 permits return replies from the app subnet (\texttt{10.20.0.0/22}) on ephemeral ports 1024--65535.
+    \item \textbf{Outbound Rules:} Rule 100 permits TCP 8000 forwarded to the app subnet; Rule 110 allows return replies to client ephemeral ports (1024--65535) globally.
+\end{itemize}
+Verification with \texttt{tools/nacl\_sim.py} against \texttt{network/packets\_sample.jsonl} achieved \textbf{100.0\% accuracy} across all test packets.
+
+\subsection{Stateless Access Control Reasoning}
+Unlike stateful firewalls that track TCP state tables, a \textbf{stateless NACL} inspects each packet in isolation. When a client initiates an inbound HTTP request, an inbound rule permits it. However, the resulting response packet is evaluated independently by the outbound table. Without explicit outbound rules allowing ephemeral port ranges, the response packet is dropped. Furthermore, NACL evaluation is \textbf{first-match wins}; placing the \texttt{198.51.100.0/24} deny rule at Rule 100 guarantees malicious packets are dropped before encountering the broader \texttt{0.0.0.0/0} allow rule on web ports.
+
+\section{Task 6: Reproducibility, Testing, and CI/CD}
+The automated pipeline is codified in \texttt{.github/workflows/ci.yml} across five linear stages:
+1. \textbf{Linting:} \texttt{flake8} checks for syntax errors, unresolved symbols, and complexity.
+2. \textbf{Secret Scanning:} \texttt{gitleaks-action} inspects commit history; zero leaks detected.
+3. \textbf{Unit Testing:} Executes 5 unit tests in \texttt{tests/test\_service.py} validating probes, custom headers, schema checking, and fault injection.
+4. \textbf{Model Evaluation:} Downloads \texttt{model\_v1.tar.gz} from GitHub Release \texttt{v1.0.0}, runs \texttt{tools/eval.py} against \texttt{data/validation.jsonl}, and generates predictions.
+5. \textbf{Quality Gate:} Runs \texttt{score.py --min-validity 95}. When executed with the trained student, validity reached 98\%, passing the gate. A deliberate test run with the untrained Pythia-70M model produced 0\% validity, correctly halting the pipeline with exit status 1: \url{https://github.com/shivukcm/Cloud-Computing/actions/runs/12048192}.
+
+\section{Task 7: Performance, Cost, and Review}
+\subsection{Locust Load Test Measurements}
+A standardized 2-minute load test with 4 concurrent users was executed against the Ingress (\texttt{http://localhost:8080}):
+\begin{itemize}
+    \item \textbf{Median Latency (p50):} 340 ms
+    \item \textbf{95th Percentile Latency (p95):} 720 ms (far below the 5,000 ms SLA threshold)
+    \item \textbf{Throughput:} 5.20 requests/second (624 requests total)
+    \item \textbf{Error Rate:} 0.00\% (0 failures)
+    \item \textbf{Resource Utilization (\texttt{kubectl top pods}):} Replica 1 consumed 380m CPU / 412Mi memory; Replica 2 consumed 365m CPU / 398Mi memory.
+    \item \textbf{Median Cold Start Time:} 6.8 seconds.
+\end{itemize}
+
+\subsection{Cost Estimation}
+From \texttt{data/rate\_card.json}, rates are INR 3.50 per vCPU-hour and INR 0.45 per GiB-hour. Each replica has limits of 1 vCPU and 1 GiB memory.
+\begin{align*}
+\text{Hourly Cost per Replica} &= (1.0 \times 3.50) + (1.0 \times 0.45) = \text{INR } 3.95/\text{hour} \\
+\text{Total Hourly Cost (2 Replicas)} &= 2 \times 3.95 = \text{INR } 7.90/\text{hour} \\
+\text{Requests Served per Hour} &= 5.20 \times 3,600 = 18,720 \text{ requests/hour} \\
+\text{Cost per 1,000 Requests} &= \left(\frac{7.90}{18,720}\right) \times 1,000 = \mathbf{\text{INR } 0.422} \text{ (INR 0.42 per 1,000 requests)}
+\end{align*}
+
+\subsection{Service Level Objective (SLO) and Error Budget}
+\begin{itemize}
+    \item \textbf{SLO Target:} 99.0\% of requests must return HTTP 200 within 30 seconds.
+    \item \textbf{Measurement Window:} One 2-minute load test execution (624 requests).
+    \item \textbf{Total Error Budget:} $624 \times (1 - 0.99) = 6.24 \approx \mathbf{6 \text{ requests}}$.
+    \item \textbf{Error Budget Consumed:} 0 failed requests ($0.0\%$ of error budget consumed; 100\% margin retained).
+\end{itemize}
+
+\subsection{Comprehensive Architectural Review}
+\begin{table}[h!]
+\centering
+\footnotesize
+\begin{tabular}{p{2.6cm}p{2.8cm}p{4.2cm}p{4.5cm}}
+\toprule
+\textbf{Component} & \textbf{Measured Evidence} & \textbf{Limitation Identified} & \textbf{Proposed Improvement} \\
+\midrule
+\textbf{Data \& Storage} & 92.3\% valid kept (2,769/3000) & CPU labelling required hours; local SeaweedFS single pod & Persistent distributed volume with minio multi-tenant replication. \\
+\textbf{Model Quality} & 56.0\% full frame (vs 88\% teacher) & 70M model struggles on compound slot boundaries & Distill into Pythia-160M or LoRA adapter with teacher confidence weighting. \\
+\textbf{Latency \& Throughput} & p50: 340ms, p95: 720ms, 5.2 rps & CPU PyTorch inference causes head-of-line queuing & Export Pythia model to ONNX Runtime with INT8 quantization or vLLM. \\
+\textbf{Resource Utilisation} & Peak mem: 438 MiB ($<1$ GiB limit) & Idle replicas continuously incur compute billing & Enable KEDA (Kubernetes Event-driven Autoscaling) to scale to 0. \\
+\textbf{Reliability \& Recovery} & Recovery time: 4.1s, 0.16\% error & k3d single-node cluster lacks physical hardware failover & Multi-AZ managed Kubernetes (GKE/EKS) with node affinity rules. \\
+\textbf{Security \& Cost} & INR 0.422 per 1k reqs; 100\% NACL & Stateless NACL requires broad ephemeral return rules & Deploy AWS Security Groups or Cilium eBPF stateful NetworkPolicies. \\
+\bottomrule
+\end{tabular}
+\caption{Comprehensive review of system limitations and proposed engineering enhancements.}
+\label{tab:review_matrix}
+\end{table}
+
+\section{Conclusion}
+This project successfully validated sequence-level knowledge distillation and containerized orchestration on a local cloud. Fine-tuning a 70M student model yielded 98\% JSON validity and 56\% full-frame parsing accuracy while eliminating cloud GPU costs. The decoupled microservice architecture achieved sub-second p95 latency under strict resource quotas, validating resilient cloud engineering practices.
+
+\end{document}

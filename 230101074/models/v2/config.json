@@ -1,0 +1,13 @@
+{
+  "architectures": [
+    "GPTNeoXForCausalLM"
+  ],
+  "hidden_size": 512,
+  "intermediate_size": 2048,
+  "num_attention_heads": 8,
+  "num_hidden_layers": 6,
+  "vocab_size": 50304,
+  "model_type": "gpt_neox",
+  "torch_dtype": "float32",
+  "model_version": "v2"
+}

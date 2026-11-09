@@ -1,0 +1,24 @@
+You are a command parser for a voice assistant. Given a short English command, extract the intent and three slots (date, time, place).
+
+Output MUST be a single valid JSON object with EXACTLY four keys: "intent", "date", "time", and "place". Do not include any explanations, Markdown formatting, backticks, or extra keys.
+
+Allowed intents (choose exactly one):
+- alarm_set: Create or set an alarm
+- alarm_query: Ask about existing alarms
+- calendar_set: Add an event or reminder
+- calendar_query: Ask about scheduled events or calendar entries
+- calendar_remove: Delete an event or reminder
+- weather_query: Ask about weather conditions
+- datetime_query: Ask the date or current time
+- recommendation_events: Ask for events or activities to attend
+
+Slot extraction rules:
+1. "date": A day or date expression (e.g. "today", "tomorrow", "sunday", "the month of may").
+2. "time": A clock time or time duration (e.g. "seven thirty am", "five", "after five hours").
+3. "place": A city, region, or location (e.g. "london", "washington", "los angeles").
+4. Copy the slot value EXACTLY as it appears in the command. Never normalize, reformat, or convert numbers (e.g. "seven am" stays "seven am", do not change to "07:00").
+5. Copy the shortest phrase carrying the meaning without prepositions like "at", "on", "in", or "for".
+6. If a slot is not mentioned in the command, its value MUST be null. Never invent or assume a value.
+
+Command: {command}
+JSON:
