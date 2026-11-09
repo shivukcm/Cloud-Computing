@@ -1,0 +1,31 @@
+# Training Configuration for EleutherAI/pythia-70m Sequence-Level Distillation
+
+# 1. Random seed for complete reproducibility
+random_seed: 42
+
+# 2. Learning rate
+learning_rate: 0.0003
+
+# 3. Batch size (CPU-optimized)
+batch_size: 8
+
+# 4. Number of training epochs
+epochs: 5
+
+# 5. Maximum sequence length for tokenization
+max_sequence_length: 128
+
+# 6. Pinned library versions
+library_versions:
+  python: "3.11"
+  torch: "2.2.2"
+  transformers: "4.38.2"
+  datasets: "2.18.0"
+  accelerate: "0.28.0"
+
+# Model and storage paths
+model_name: "EleutherAI/pythia-70m"
+data_path: "datasets/v1/train.jsonl"
+output_dir_v1: "models/v1"
+output_dir_v2: "models/v2"
+loss_csv: "training/loss.csv"
